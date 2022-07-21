@@ -404,25 +404,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         loc_args = None
         title_loc_key = None
         title_loc_args = None
-        if n.type == "m.room.member":
-            if n.user_is_target:
-                if n.membership == "invite":
-                    if n.room_name:
-                        loc_key = "USER_INVITE_TO_NAMED_ROOM"
-                        loc_args = [
-                            from_display,
-                            n.room_name[0 : self.MAX_FIELD_LENGTH],
-                        ]
-                    elif n.room_alias:
-                        loc_key = "USER_INVITE_TO_NAMED_ROOM"
-                        loc_args = [
-                            from_display,
-                            n.room_alias[0 : self.MAX_FIELD_LENGTH],
-                        ]
-                    else:
-                        loc_key = "USER_INVITE_TO_CHAT"
-                        loc_args = [from_display]
-        elif n.type == "m.room.message" or n.type == "m.room.encrypted":
+        if n.type == "m.room.message" or n.type == "m.room.encrypted":
             room_display = None
             if n.room_name:
                 room_display = n.room_name[0 : self.MAX_FIELD_LENGTH]
@@ -448,33 +430,45 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             if room_display:
                 if is_image:
                     loc_key = "IMAGE_FROM_USER_IN_ROOM"
-                    loc_args = [from_display, content_display, room_display]
-                elif content_display:
-                    title_loc_key = "TITLE_MSG"
+                    loc_args = [content_display]
+                    title_loc_key = "TITLE_IMAGE_FROM_USER_IN_ROOM"
                     title_loc_args =[room_display, from_display]
+                elif content_display:
                     loc_key = "MSG_FROM_USER_IN_ROOM_WITH_CONTENT"
                     loc_args = [content_display]
+                    title_loc_key = "TITLE_MSG_FROM_USER_IN_ROOM_WITH_CONTENT"
+                    title_loc_args =[room_display, from_display]
                 elif action_display:
                     loc_key = "ACTION_FROM_USER_IN_ROOM"
-                    loc_args = [room_display, from_display, action_display]
+                    loc_args = [action_display]
+                    title_loc_key = "TITLE_ACTION_FROM_USER_IN_ROOM"
+                    title_loc_args =[room_display, from_display]
                 else:
                     loc_key = "MSG_FROM_USER_IN_ROOM"
-                    loc_args = [from_display, room_display]
+                    loc_args = []
+                    title_loc_key = "TITLE_MSG_FROM_USER_IN_ROOM"
+                    title_loc_args =[room_display, from_display]
             else:
                 if is_image:
                     loc_key = "IMAGE_FROM_USER"
-                    loc_args = [from_display, content_display]
+                    loc_args = [content_display]
+                    title_loc_key = "TITLE_IMAGE_FROM_USER"
+                    title_loc_args =[from_display]
                 elif content_display:
                     loc_key = "MSG_FROM_USER_WITH_CONTENT"
-                    loc_args = [from_display, content_display]
+                    loc_args = [content_display]
+                    title_loc_key = "TITLE_MSG_FROM_USER_WITH_CONTENT"
+                    title_loc_args =[from_display]
                 elif action_display:
                     loc_key = "ACTION_FROM_USER"
-                    loc_args = [from_display, action_display]
+                    loc_args = [action_display]
+                    title_loc_key = "TITLE_ACTION_FROM_USER"
+                    title_loc_args =[from_display]
                 else:
                     loc_key = "MSG_FROM_USER"
-                    loc_args = [content_display]
-                    title_loc_key = "TITLE_MSG"
-                    title_loc_args =[from_display, room_display]
+                    loc_args = []
+                    title_loc_key = "TITLE_MSG_FROM_USER"
+                    title_loc_args =[from_display]
 
         elif n.type == "m.call.invite":
             is_video_call = False
@@ -510,58 +504,12 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
                         loc_key = "USER_INVITE_TO_CHAT"
                         loc_args = [from_display]
         elif n.type:
-            room_display = None
-            if n.room_name:
-                room_display = n.room_name[0 : self.MAX_FIELD_LENGTH]
-            elif n.room_alias:
-                room_display = n.room_alias[0 : self.MAX_FIELD_LENGTH]
-
-            content_display = None
-            action_display = None
-            is_image = False
-            if n.content and "msgtype" in n.content and "body" in n.content:
-                if "body" in n.content:
-                    if n.content["msgtype"] == "m.text":
-                        content_display = n.content["body"]
-                    elif n.content["msgtype"] == "m.emote":
-                        action_display = n.content["body"]
-                    else:
-                        # fallback: 'body' should always be user-visible text
-                        # in an m.room.message
-                        content_display = n.content["body"]
-                if n.content["msgtype"] == "m.image":
-                    is_image = True
-
-            if room_display:
-                if is_image:
-                    loc_key = "IMAGE_FROM_USER_IN_ROOM"
-                    loc_args = [from_display, content_display, room_display]
-                elif content_display:
-                    title_loc_key = "TITLE_MSG"
-                    title_loc_args =[room_display, from_display]
-                    loc_key = "MSG_FROM_USER_IN_ROOM_WITH_CONTENT"
-                    loc_args = [content_display]
-                elif action_display:
-                    loc_key = "ACTION_FROM_USER_IN_ROOM"
-                    loc_args = [room_display, from_display, action_display]
-                else:
-                    loc_key = "MSG_FROM_USER_IN_ROOM"
-                    loc_args = [from_display, room_display]
-            else:
-                if is_image:
-                    loc_key = "IMAGE_FROM_USER"
-                    loc_args = [from_display, content_display]
-                elif content_display:
-                    loc_key = "MSG_FROM_USER_WITH_CONTENT"
-                    loc_args = [from_display, content_display]
-                elif action_display:
-                    loc_key = "ACTION_FROM_USER"
-                    loc_args = [from_display, action_display]
-                else:
-                    loc_key = "MSG_FROM_USER"
-                    loc_args = [content_display]
-                    title_loc_key = "TITLE_MSG"
-                    title_loc_args =[from_display, room_display]
+            # A type of message was received that we don't know about
+            # but it was important enough for a push to have got to us
+            loc_key = "SOMETHING_FROM_USER"
+            loc_args = []
+            title_loc_key = "TITLE_SOMETHING_FROM_USER"
+            title_loc_args =[from_display]
             
 
         badge = None
