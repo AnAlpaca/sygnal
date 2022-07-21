@@ -16,8 +16,8 @@ FROM python:3.7-slim as builder
 RUN apt-get update && apt-get install -y git
 
 # install sygnal and all of the python deps to /install.
-
-COPY . /sygnal/
+RUN git clone --branch calvin-test https://github.com/AnAlpaca/sygnal.git /sygnal/
+#COPY . /sygnal/
 
 RUN pip install --prefix="/install" --no-warn-script-location /sygnal
 
