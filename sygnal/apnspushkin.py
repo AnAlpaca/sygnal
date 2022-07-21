@@ -17,6 +17,7 @@
 import asyncio
 import base64
 import copy
+import json
 import logging
 import os
 from datetime import timezone
@@ -237,6 +238,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             with ACTIVE_REQUESTS_GAUGE.track_inprogress():
                 with SEND_TIME_HISTOGRAM.time():
                     response = await self._send_notification(request)
+                    log.info("Request is: %s", str(request))
         except aioapns.ConnectionError:
             raise TemporaryNotificationDispatchException("aioapns Connection Failure")
 
@@ -400,6 +402,8 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
 
         loc_key = None
         loc_args = None
+        title_loc_key = None
+        title_loc_args = None
         if n.type == "m.room.message" or n.type == "m.room.encrypted":
             room_display = None
             if n.room_name:
@@ -428,8 +432,10 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
                     loc_key = "IMAGE_FROM_USER_IN_ROOM"
                     loc_args = [from_display, content_display, room_display]
                 elif content_display:
+                    title_loc_key = "TITLE_MSG"
+                    title_loc_args =[room_display, from_display]
                     loc_key = "MSG_FROM_USER_IN_ROOM_WITH_CONTENT"
-                    loc_args = [from_display, room_display, content_display]
+                    loc_args = [content_display]
                 elif action_display:
                     loc_key = "ACTION_FROM_USER_IN_ROOM"
                     loc_args = [room_display, from_display, action_display]
@@ -448,7 +454,9 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
                     loc_args = [from_display, action_display]
                 else:
                     loc_key = "MSG_FROM_USER"
-                    loc_args = [from_display]
+                    loc_args = [content_display]
+                    title_loc_key = "TITLE_MSG"
+                    title_loc_args =[from_display, room_display]
 
         elif n.type == "m.call.invite":
             is_video_call = False
@@ -487,7 +495,10 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             # A type of message was received that we don't know about
             # but it was important enough for a push to have got to us
             loc_key = "MSG_FROM_USER"
-            loc_args = [from_display]
+            loc_args = [content_display]
+            title_loc_key = "TITLE_MSG"
+            title_loc_args =[from_display, room_display]
+            
 
         badge = None
         if n.counts.unread is not None:
@@ -514,6 +525,12 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         if loc_args:
             payload["aps"].setdefault("alert", {})["loc-args"] = loc_args
 
+        if title_loc_key:
+            payload["aps"].setdefault("alert", {})["title-loc-key"] = title_loc_key
+
+        if title_loc_args:
+            payload["aps"].setdefault("alert", {})["title-loc-args"] = title_loc_args
+
         if badge is not None:
             payload["aps"]["badge"] = badge
 
@@ -530,3 +547,6 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         return await Deferred.fromFuture(
             asyncio.ensure_future(self.apns_client.send_notification(request))
         )
+
+
+
