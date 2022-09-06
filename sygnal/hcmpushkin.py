@@ -69,7 +69,8 @@ RESPONSE_STATUS_CODES_COUNTER = Counter(
 
 logger = logging.getLogger(__name__)
 
-HCM_URL = b"https://push-api.cloud.huawei.com/v1/{0}/messages:send"
+HCM_URL = b"https://push-api.cloud.huawei.com/v2/" #
+HCM_URL_PATH = b"/messages:send"
 MAX_TRIES = 3
 RETRY_DELAY_BASE = 10
 MAX_BYTES_PER_FIELD = 1024
@@ -80,17 +81,15 @@ MAX_BYTES_PER_FIELD = 1024
 # though hcm-client 'helpfully' extracts these into a separate
 # list.
 BAD_PUSHKEY_FAILURE_CODES = [
-    "MissingRegistration",
-    "InvalidRegistration",
-    "NotRegistered",
-    "InvalidPackageName",
-    "MismatchSenderId",
+    "80100000",
 ]
 
 # Failure codes that mean the message in question will never
 # succeed, so don't retry, but the registration ID is fine
 # so we should not reject it upstream.
-BAD_MESSAGE_FAILURE_CODES = ["MessageTooBig", "InvalidDataKey", "InvalidTtl"]
+BAD_MESSAGE_FAILURE_CODES = ["80100001", "80100003", "80100004", "80300008", "80300010"]
+
+BAD_AUTH_FAILURE_CODES = ["80200003", "80200001", "80300002", "80300007", "80600003"]
 
 DEFAULT_MAX_CONNECTIONS = 20
 
@@ -102,8 +101,9 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
 
     UNDERSTOOD_CONFIG_FIELDS = {
         "type",
-        "api_key",
-        "hcm_options",
+        "app_id",
+        "project_id",
+        "client_secret",
         "max_connections",
     } | ConcurrencyLimitedPushkin.UNDERSTOOD_CONFIG_FIELDS
 
@@ -126,7 +126,6 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         self.http_pool.maxPersistentPerHost = self.max_connections
 
         tls_client_options_factory = ClientTLSOptionsFactory()
-
         # use the Sygnal global proxy configuration
         proxy_url = sygnal.config.get("proxy")
 
@@ -137,18 +136,31 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
             proxy_url_str=proxy_url,
         )
 
-        self.api_key = self.get_config("api_key", str)
-        if not self.api_key:
-            raise PushkinSetupException("No API key set in config")
+        self.app_id = self.get_config("app_id", int)
+        if not self.app_id:
+            raise PushkinSetupException("No App ID set in config, please find in AppGallery Connect page")
+
+        self.project_id = self.get_config("project_id", int)
+        if not self.project_id:
+            raise PushkinSetupException("No Project ID set in config, please find in AppGallery Connect page")
+
+        self.client_secret = self.get_config("client_secret", str)
+        if not self.project_id:
+            raise PushkinSetupException("No Client Secret set in config, please find in AppGallery Connect page")
 
         # Use the hcm_options config dictionary as a foundation for the body;
         # this lets the Sygnal admin choose custom hcm options
         # (e.g. content_available).
+        self.hcm_app_url = HCM_URL + bytes(str(self.project_id), 'utf-8') + HCM_URL_PATH
+        self.access_token = None
+        
         self.base_request_body = self.get_config("hcm_options", dict, {})
         if not isinstance(self.base_request_body, dict):
             raise PushkinSetupException(
                 "Config field hcm_options, if set, must be a dictionary of options"
             )
+        
+    
 
     @classmethod
     async def create(
@@ -164,6 +176,75 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         """
         return cls(name, sygnal, config)
 
+    async def _fetch_access_token(self) -> str:
+        """
+        Generate an access token to access Huawei public app-level APIs.
+        Args:
+
+        Returns:
+            an access token of type string
+        """
+
+        body = '&grant_type=client_credentials&client_id=106945189&client_secret=2a68ffecdbb5826c71ca144a7df1d3f3992c446950249aad6915b2e7c1ab72e2&'
+        headers = {
+            'Accept':'*/*',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+
+        response, response_text = await self._perform_access_request(body=body, headers=headers,)
+
+
+        logger.info(json.dumps(response_text))
+        response_object = json.loads(response_text)
+        access_token = response_object["access_token"]
+        return access_token
+
+    async def _perform_access_request(
+        self, body: Dict, headers: Dict[AnyStr, List[AnyStr]]
+    ) -> Tuple[IResponse, str]:
+        """
+        Perform an HTTP request to the HCM server with the body and headers
+        specified.
+        Args:
+            body: Body. Will be JSON-encoded.
+            headers: HTTP Headers.
+
+        Returns:
+
+        """
+        body_producer = FileBodyProducer(BytesIO(json.dumps(body).encode()))
+        hcm_app_url = b"https://oauth-login.cloud.huawei.com/oauth2/v3/token"
+
+        #logger.info(hcm_app_url)
+        #logger.info(json.dumps(body))
+        #logger.info(json.dumps(headers))
+
+        # we use the semaphore to actually limit the number of concurrent
+        # requests, since the HTTPConnectionPool will actually just lead to more
+        # requests being created but not pooled – it does not perform limiting.
+        with QUEUE_TIME_HISTOGRAM.time():
+            with PENDING_REQUESTS_GAUGE.track_inprogress():
+                await self.connection_semaphore.acquire()
+
+        try:
+            with SEND_TIME_HISTOGRAM.time():
+                with ACTIVE_REQUESTS_GAUGE.track_inprogress():
+                    response = await self.http_agent.request(
+                        b"POST",
+                        hcm_app_url,
+                        headers=Headers(headers),
+                        bodyProducer=body_producer,
+                    )
+                    response_text = (await readBody(response)).decode()
+        except Exception as exception:
+            raise TemporaryNotificationDispatchException(
+                "HCM request failure"
+            ) from exception
+        finally:
+            self.connection_semaphore.release()
+        return response, response_text
+
+
     async def _perform_http_request(
         self, body: Dict, headers: Dict[AnyStr, List[AnyStr]]
     ) -> Tuple[IResponse, str]:
@@ -178,6 +259,8 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
 
         """
         body_producer = FileBodyProducer(BytesIO(json.dumps(body).encode()))
+        logger.info(json.dumps(body))
+        #logger.info(json.dumps(headers))
 
         # we use the semaphore to actually limit the number of concurrent
         # requests, since the HTTPConnectionPool will actually just lead to more
@@ -191,7 +274,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
                 with ACTIVE_REQUESTS_GAUGE.track_inprogress():
                     response = await self.http_agent.request(
                         b"POST",
-                        HCM_URL,
+                        self.hcm_app_url,
                         headers=Headers(headers),
                         bodyProducer=body_producer,
                     )
@@ -216,19 +299,19 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         poke_start_time = time.time()
 
         failed = []
-
+        if (self.access_token is None):
+            self.access_token = await self._fetch_access_token()
         response, response_text = await self._perform_http_request(body, headers)
-
         RESPONSE_STATUS_CODES_COUNTER.labels(
             pushkin=self.name, code=response.code
         ).inc()
-
+        
         log.debug("HCM request took %f seconds", time.time() - poke_start_time)
 
         span.set_tag(tags.HTTP_STATUS_CODE, response.code)
-
-        if 500 <= response.code < 600:
-            log.debug("%d from server, waiting to try again", response.code)
+        
+        if response.code == 500:
+            log.debug("%d from server, waiting to try again. Internal service error.", response.code)
 
             retry_after = None
 
@@ -241,6 +324,28 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
             raise TemporaryNotificationDispatchException(
                 "HCM server error, hopefully temporary.", custom_retry_delay=retry_after
             )
+        elif response.code == 502:
+            log.debug("%d from server, waiting to try again. The connection request is abnormal, generally because the network is unstable.", response.code)
+
+            retry_after = None
+
+            for header_value in response.headers.getRawHeaders(
+                b"retry-after", default=[]
+            ):
+                retry_after = int(header_value)
+                span.log_kv({"event": "hcm_retry_after", "retry_after": retry_after})
+
+            raise TemporaryNotificationDispatchException(
+                "HCM server error, hopefully temporary.", custom_retry_delay=retry_after
+            )
+
+        elif response.code == 503:
+            log.debug("%d from server, this is due to too much traffic.", response.code)
+            log.debug("Set the average push speed to a value smaller than the QPS quota provided by Huawei. For details about the QPS quota, please refer to FAQs. Set the average push interval. Do not push messages too frequently in a period of time.")
+            raise TemporaryNotificationDispatchException(
+                "Traffic control error.", custom_retry_delay=retry_after
+            )
+
         elif response.code == 400:
             log.error(
                 "%d from server, we have sent something invalid! Error: %r",
@@ -251,72 +356,83 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
             raise NotificationDispatchException("Invalid request")
         elif response.code == 401:
             log.error(
-                "401 from server! Our API key is invalid? Error: %r", response_text
+                "401 from server! Our Access Token is invalid or Expaired? Error: %r", response_text
             )
             # permanent failure: give up
             raise NotificationDispatchException("Not authorised to push")
+
         elif response.code == 404:
             # assume they're all failed
-            log.info("Reg IDs %r get 404 response; assuming unregistered", pushkeys)
-            return pushkeys, []
+            log.info("Service not found. Verify that the request URI is correct.")
+            raise NotificationDispatchException("Service not found")
+
         elif 200 <= response.code < 300:
             try:
                 resp_object = json_decoder.decode(response_text)
             except ValueError:
                 raise NotificationDispatchException("Invalid JSON response from hcm.")
-            if "results" not in resp_object:
+            if "code" not in resp_object:
                 log.error(
-                    "%d from server but response contained no 'results' key: %r",
+                    "%d from server but response contained no 'code' key: %r",
                     response.code,
                     response_text,
                 )
-            if len(resp_object["results"]) < len(pushkeys):
-                log.error(
-                    "Sent %d notifications but only got %d responses!",
-                    len(n.devices),
-                    len(resp_object["results"]),
+            
+            new_pushkeys = []
+            if  resp_object["code"] == "80200003":
+                log.error("%d from server but OAuth token expired. The access token in the Authorization parameter in the request HTTP header has expired. Obtain a new access token: %r - %r",
+                    response.code,
+                    resp_object["code"],
+                    resp_object["msg"],
+                    )
+                self.access_token = await self._fetch_access_token()
+                log.info(
+                    "Push Tokens %r has temporarily failed with code %r",
+                    pushkeys,
+                    resp_object["code"],
                 )
-                span.log_kv(
-                    {
-                        logs.EVENT: "hcm_response_mismatch",
-                        "num_devices": len(n.devices),
-                        "num_results": len(resp_object["results"]),
-                    }
-                )
+                new_pushkeys.append(pushkeys)
 
             # determine which pushkeys to retry or forget about
-            new_pushkeys = []
-            for i, result in enumerate(resp_object["results"]):
-                if "error" in result:
-                    log.warning(
-                        "Error for pushkey %s: %s", pushkeys[i], result["error"]
+            
+            if  resp_object["code"] == "80100000":
+                log.error("%d from server but some push tokens were invalid and not delievered: %r - %r",
+                    response.code,
+                    resp_object["code"],
+                    resp_object["msg"],
                     )
-                    span.set_tag("hcm_error", result["error"])
-                    if result["error"] in BAD_PUSHKEY_FAILURE_CODES:
+                
+                for i, result in enumerate(json_decoder.decode(resp_object["msg"])["illegal_tokens"]):
+                    log.warning(
+                        "Error for pushkey %s", pushkeys[i],
+                    )
+                    span.set_tag("hcm_error", resp_object["code"])
+                    if resp_object["code"] in BAD_PUSHKEY_FAILURE_CODES:
                         log.info(
-                            "Reg ID %r has permanently failed with code %r: "
+                            "Push Token %r has permanently failed with code %r: "
                             "rejecting upstream",
                             pushkeys[i],
-                            result["error"],
+                            resp_object["code"],
                         )
                         failed.append(pushkeys[i])
-                    elif result["error"] in BAD_MESSAGE_FAILURE_CODES:
+                    elif resp_object["code"] in BAD_MESSAGE_FAILURE_CODES:
                         log.info(
-                            "Message for reg ID %r has permanently failed with code %r",
+                            "Message for push token %r has permanently failed with code %r",
                             pushkeys[i],
-                            result["error"],
+                            resp_object["code"],
                         )
                     else:
                         log.info(
-                            "Reg ID %r has temporarily failed with code %r",
+                            "Push Token %r has temporarily failed with code %r",
                             pushkeys[i],
-                            result["error"],
+                            resp_object["code"],
                         )
                         new_pushkeys.append(pushkeys[i])
             return failed, new_pushkeys
+            
         else:
             raise NotificationDispatchException(
-                f"Unknown HCM response code {response.code}"
+                f"Unknown HCM response code: {response.code}, {response.phrase}"
             )
 
     async def _dispatch_notification_unlimited(
@@ -343,7 +459,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         # to someone.
         # span_tags = {"pushkeys": pushkeys}
         span_tags = {"hcm_num_devices": len(pushkeys)}
-
+        
         with self.sygnal.tracer.start_span(
             "hcm_dispatch", tags=span_tags, child_of=context.opentracing_span
         ) as span_parent:
@@ -358,19 +474,17 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
 
             headers = {
                 "User-Agent": ["sygnal"],
-                "Content-Type": ["application/json"],
-                "Authorization": ["key=%s" % (self.api_key,)],
+                'Content-Type':['application/json'],
+                'Authorization':['Bearer %s' % (self.access_token)]
             }
-
             body = self.base_request_body.copy()
-            body["data"] = data
-            body["priority"] = "normal" if n.prio == "low" else "high"
+            body["message"] = {}
+            body["message"]["data"] = json.dumps(data)
+            body["validate_only"] = False
+            
 
             for retry_number in range(0, MAX_TRIES):
-                if len(pushkeys) == 1:
-                    body["to"] = pushkeys[0]
-                else:
-                    body["registration_ids"] = pushkeys
+                body["message"]["token"] = pushkeys
 
                 log.info("Sending (attempt %i) => %r", retry_number, pushkeys)
 
@@ -425,6 +539,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         Returns:
             JSON-compatible dict or None if the default_payload is misconfigured
         """
+
         data = {}
 
         if device.data:
@@ -464,3 +579,6 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
             data["missed_calls"] = n.counts.missed_calls
 
         return data
+
+
+# 

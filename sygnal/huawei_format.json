@@ -1,0 +1,46 @@
+//Notification message body example:
+{
+    "validate_only": false,
+    "message": {
+        "android": {
+            "notification": {
+                "title": "test title",
+                "body": "test body",
+                "click_action": {
+                    "type": 3
+                }
+            }
+        },
+        "token": ["pushtoken1"]
+    }
+}
+//Data message body example:
+{
+    "validate_only": false,
+    "message": {
+        "data": "{'param1':'value1','param2':'value2'}",
+        "token": ["pushtoken1"]
+    }
+}
+
+{
+    "data":{
+       "event_id":"$3957tyerfgewrf384",
+       "type":"m.room.message",
+       "sender":"@jrh:pageme.co.za",
+       "room_name":"Mission Control",
+       "room_alias":"#exampleroom:example.org",
+       "membership":null,
+       "sender_display_name":"Major Tom",
+       "content":{
+          "msgtype":"m.text",
+          "body":"I'm floating in a most peculiar way."
+       },
+       "room_id":"!slw48wfj34rtnrf:example.org",
+       "prio":"high",
+       "unread":2,
+       "missed_calls":1
+    },
+    "priority":"high",
+    "to":"IQAAAACy0vkkAABHaeHzIHV7fIe5ZzteDhsvkmwWDnDDUeU_pcoV5AUVH7CtyLCBKZfKikvuQ4gemh_WthDZBPjyJ-G8LuMKDqj0aibuezYVjFu58g"
+ }
