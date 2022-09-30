@@ -194,7 +194,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         response, response_text = await self._perform_access_request(body=body, headers=headers,)
 
 
-        logger.info(json.dumps(response_text))
+        #logger.info(json.dumps(response_text))
         response_object = json.loads(response_text)
         access_token = response_object["access_token"]
         return access_token
@@ -259,7 +259,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
 
         """
         body_producer = FileBodyProducer(BytesIO(json.dumps(body).encode()))
-        logger.info(json.dumps(body))
+        #logger.info(json.dumps(body))
         #logger.info(json.dumps(headers))
 
         # we use the semaphore to actually limit the number of concurrent

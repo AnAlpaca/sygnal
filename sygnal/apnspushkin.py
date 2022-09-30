@@ -362,9 +362,24 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         Returns:
             The APNs payload as a nested dicts.
         """
+        badge = None
+
         payload = {}
 
         payload.update(default_payload)
+        payload.setdefault("aps", {})
+
+        payload["aps"].setdefault("mutable-content", 1)
+        payload["aps"].setdefault("sound", "default")
+        payload["aps"].setdefault("category", "PREVIEW")
+
+
+        payload["aps"].setdefault("alert", {})["body"] = "You have a new encrypted notification"
+        payload["aps"].setdefault("alert", {})["title"] = "New Notification"
+
+
+        if badge is not None:
+            payload["aps"]["badge"] = badge
 
         if n.room_id:
             payload["room_id"] = n.room_id
@@ -375,7 +390,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             payload["unread_count"] = n.counts.unread
         if n.counts.missed_calls is not None:
             payload["missed_calls"] = n.counts.missed_calls
-
+        print("Payload Event ID only: " + json.dumps(payload))
         return payload
 
     def _get_payload_full(
@@ -530,6 +545,8 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             payload = copy.deepcopy(device.data.get("default_payload", {}))
 
         payload.setdefault("aps", {})
+        payload["aps"].setdefault("mutable-content", 1)
+        payload["aps"].setdefault("sound", "default")
 
         if loc_key:
             payload["aps"].setdefault("alert", {})["loc-key"] = loc_key
@@ -550,7 +567,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             payload["room_id"] = n.room_id
         if loc_key and n.event_id:
             payload["event_id"] = n.event_id
-
+        print("Payload Full: " + json.dumps(payload))
         return payload
 
     async def _send_notification(
