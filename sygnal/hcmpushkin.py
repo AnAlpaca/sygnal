@@ -194,7 +194,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         response, response_text = await self._perform_access_request(body=body, headers=headers,)
 
 
-        #logger.info(json.dumps(response_text))
+        logger.debug("Access Token: " + json.dumps(response_text))
         response_object = json.loads(response_text)
         access_token = response_object["access_token"]
         return access_token
@@ -215,9 +215,6 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         body_producer = FileBodyProducer(BytesIO(json.dumps(body).encode()))
         hcm_app_url = b"https://oauth-login.cloud.huawei.com/oauth2/v3/token"
 
-        #logger.info(hcm_app_url)
-        #logger.info(json.dumps(body))
-        #logger.info(json.dumps(headers))
 
         # we use the semaphore to actually limit the number of concurrent
         # requests, since the HTTPConnectionPool will actually just lead to more
@@ -259,8 +256,6 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
 
         """
         body_producer = FileBodyProducer(BytesIO(json.dumps(body).encode()))
-        #logger.info(json.dumps(body))
-        #logger.info(json.dumps(headers))
 
         # we use the semaphore to actually limit the number of concurrent
         # requests, since the HTTPConnectionPool will actually just lead to more
@@ -299,12 +294,8 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
         poke_start_time = time.time()
 
         failed = []
-        if (self.access_token is None):
-            self.access_token = await self._fetch_access_token()
         response, response_text = await self._perform_http_request(body, headers)
-        RESPONSE_STATUS_CODES_COUNTER.labels(
-            pushkin=self.name, code=response.code
-        ).inc()
+        RESPONSE_STATUS_CODES_COUNTER.labels(pushkin=self.name, code=response.code).inc()
         
         log.debug("HCM request took %f seconds", time.time() - poke_start_time)
 
@@ -363,7 +354,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
 
         elif response.code == 404:
             # assume they're all failed
-            log.info("Service not found. Verify that the request URI is correct.")
+            log.error("Service not found. Verify that the request URI is correct.")
             raise NotificationDispatchException("Service not found")
 
         elif 200 <= response.code < 300:
@@ -385,8 +376,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
                     resp_object["code"],
                     resp_object["msg"],
                     )
-                self.access_token = await self._fetch_access_token()
-                log.info(
+                log.error(
                     "Push Tokens %r has temporarily failed with code %r",
                     pushkeys,
                     resp_object["code"],
@@ -408,7 +398,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
                     )
                     span.set_tag("hcm_error", resp_object["code"])
                     if resp_object["code"] in BAD_PUSHKEY_FAILURE_CODES:
-                        log.info(
+                        log.error(
                             "Push Token %r has permanently failed with code %r: "
                             "rejecting upstream",
                             pushkeys[i],
@@ -416,7 +406,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
                         )
                         failed.append(pushkeys[i])
                     elif resp_object["code"] in BAD_MESSAGE_FAILURE_CODES:
-                        log.info(
+                        log.error(
                             "Message for push token %r has permanently failed with code %r",
                             pushkeys[i],
                             resp_object["code"],
@@ -456,7 +446,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
             return []
 
         # The pushkey is kind of secret because you can use it to send push
-        # to someone.
+        # to someone.   
         # span_tags = {"pushkeys": pushkeys}
         span_tags = {"hcm_num_devices": len(pushkeys)}
         
@@ -472,6 +462,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
             if data is None:
                 failed.append(device.pushkey)
 
+            self.access_token = await self._fetch_access_token()
             headers = {
                 "User-Agent": ["sygnal"],
                 'Content-Type':['application/json'],
@@ -522,7 +513,7 @@ class HcmPushkin(ConcurrencyLimitedPushkin):
                     )
 
             if len(pushkeys) > 0:
-                log.info("Gave up retrying reg IDs: %r", pushkeys)
+                log.error("Gave up retrying reg IDs: %r", pushkeys)
             # Count the number of failed devices.
             span_parent.set_tag("hcm_num_failed", len(failed))
             return failed
