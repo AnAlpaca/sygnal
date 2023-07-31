@@ -362,7 +362,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         Returns:
             The APNs payload as a nested dicts.
         """
-        badge = None
+        badge = n.counts.unread
 
         payload = {}
 
@@ -371,7 +371,6 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
 
         payload["aps"].setdefault("mutable-content", 1)
         payload["aps"].setdefault("sound", "default")
-        payload["aps"].setdefault("category", "PREVIEW")
 
 
         payload["aps"].setdefault("alert", {})["body"] = "You have a new encrypted notification"
