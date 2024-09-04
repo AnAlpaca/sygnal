@@ -21,6 +21,11 @@ import logging.config
 import os
 import sys
 from typing import Any, Dict, Generator, Set, cast
+import asyncio
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
 import opentracing
 import prometheus_client
@@ -40,7 +45,7 @@ from twisted.python import log as twisted_log
 from twisted.python.failure import Failure
 from zope.interface import Interface
 
-from sygnal.http import PushGatewayApiServer
+from .sygnal_http import PushGatewayApiServer
 from sygnal.notifications import Pushkin
 
 logger = logging.getLogger(__name__)

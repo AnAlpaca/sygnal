@@ -17,6 +17,7 @@
 import asyncio
 import base64
 import copy
+import json
 import logging
 import os
 from datetime import timezone
@@ -25,7 +26,7 @@ from uuid import uuid4
 
 import aioapns
 from aioapns import APNs, NotificationRequest
-from aioapns.common import NotificationResult, PushType
+from aioapns.common import NotificationResult
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509 import load_pem_x509_certificate
 from opentracing import Span, logs, tags
@@ -109,18 +110,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         "key_id",
         "keyfile",
         "topic",
-        "push_type",
-        "convert_device_token_to_hex",
     } | ConcurrencyLimitedPushkin.UNDERSTOOD_CONFIG_FIELDS
-
-    APNS_PUSH_TYPES = {
-        "alert": PushType.ALERT,
-        "background": PushType.BACKGROUND,
-        "voip": PushType.VOIP,
-        "complication": PushType.COMPLICATION,
-        "fileprovider": PushType.FILEPROVIDER,
-        "mdm": PushType.MDM,
-    }
 
     def __init__(self, name: str, sygnal: "Sygnal", config: Dict[str, Any]) -> None:
         super().__init__(name, sygnal, config)
@@ -173,49 +163,34 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             # this overrides the create_connection method to use a HTTP proxy
             loop = ProxyingEventLoopWrapper(loop, proxy_url_str)  # type: ignore
 
-        async def make_apns() -> aioapns.APNs:
-            if certfile is not None:
-                # max_connection_attempts is actually the maximum number of
-                # additional connection attempts, so =0 means try once only
-                # (we will retry at a higher level so not worth doing more here)
-                apns_client = APNs(
-                    client_cert=certfile,
-                    use_sandbox=self.use_sandbox,
-                    max_connection_attempts=0,
-                )
+        if certfile is not None:
+            # max_connection_attempts is actually the maximum number of
+            # additional connection attempts, so =0 means try once only
+            # (we will retry at a higher level so not worth doing more here)
+            self.apns_client = APNs(
+                client_cert=certfile,
+                use_sandbox=self.use_sandbox,
+                max_connection_attempts=0,
+                loop=loop,
+            )
 
-                self._report_certificate_expiration(certfile)
-
-                return apns_client
-            else:
-                # max_connection_attempts is actually the maximum number of
-                # additional connection attempts, so =0 means try once only
-                # (we will retry at a higher level so not worth doing more here)
-                return APNs(
-                    key=self.get_config("keyfile", str),
-                    key_id=self.get_config("key_id", str),
-                    team_id=self.get_config("team_id", str),
-                    topic=self.get_config("topic", str),
-                    use_sandbox=self.use_sandbox,
-                    max_connection_attempts=0,
-                )
-
-        self.apns_client = loop.run_until_complete(make_apns())
-
-        push_type = self.get_config("push_type", str)
-        if not push_type:
-            self.push_type = None
+            self._report_certificate_expiration(certfile)
         else:
-            if push_type not in self.APNS_PUSH_TYPES.keys():
-                raise PushkinSetupException(f"Invalid value for push_type: {push_type}")
-
-            self.push_type = self.APNS_PUSH_TYPES[push_type]
+            # max_connection_attempts is actually the maximum number of
+            # additional connection attempts, so =0 means try once only
+            # (we will retry at a higher level so not worth doing more here)
+            self.apns_client = APNs(
+                key=self.get_config("keyfile", str),
+                key_id=self.get_config("key_id", str),
+                team_id=self.get_config("team_id", str),
+                topic=self.get_config("topic", str),
+                use_sandbox=self.use_sandbox,
+                max_connection_attempts=0,
+                loop=loop,
+            )
 
         # without this, aioapns will retry every second forever.
         self.apns_client.pool.max_connection_attempts = 3
-
-        # without this, aioapns will not use the proxy if one is configured.
-        self.apns_client.pool.loop = loop
 
     def _report_certificate_expiration(self, certfile: str) -> None:
         """Export the epoch time that the certificate expires as a metric."""
@@ -235,32 +210,35 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         device: Device,
         shaved_payload: Dict[str, Any],
         prio: int,
-        notif_id: str,
     ) -> List[str]:
         """
         Actually attempts to dispatch the notification once.
         """
+
+        # this is no good: APNs expects ID to be in their format
+        # so we can't just derive a
+        # notif_id = context.request_id + f"-{n.devices.index(device)}"
+
+        notif_id = str(uuid4())
+
+        log.info(f"Sending as APNs-ID {notif_id}")
         span.set_tag("apns_id", notif_id)
 
-        # Some client libraries will provide the push token in hex format already. Avoid
-        # attempting to convert from base 64 to hex.
-        if self.get_config("convert_device_token_to_hex", bool, True):
-            device_token = base64.b64decode(device.pushkey).hex()
-        else:
-            device_token = device.pushkey
+        device_token = base64.b64decode(device.pushkey).hex()
 
         request = NotificationRequest(
             device_token=device_token,
             message=shaved_payload,
             priority=prio,
             notification_id=notif_id,
-            push_type=self.push_type,
         )
 
         try:
+
             with ACTIVE_REQUESTS_GAUGE.track_inprogress():
                 with SEND_TIME_HISTOGRAM.time():
                     response = await self._send_notification(request)
+                    log.info("Request is: %s", str(request))
         except aioapns.ConnectionError:
             raise TemporaryNotificationDispatchException("aioapns Connection Failure")
 
@@ -274,7 +252,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             return []
         else:
             # .description corresponds to the 'reason' response field
-            span.set_tag("apns_reason", response.description or "None")
+            span.set_tag("apns_reason", response.description)
             if (code, response.description) in self.TOKEN_ERRORS:
                 log.info(
                     "APNs token %s for pushkin %s was rejected: %d %s",
@@ -315,9 +293,8 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             if device.data:
                 default_payload = device.data.get("default_payload", {})
                 if not isinstance(default_payload, dict):
-                    log.warning(
-                        "Rejecting pushkey due to misconfigured default_payload, "
-                        "please ensure that default_payload is a dict."
+                    log.error(
+                        "default_payload is malformed, this value must be a dict."
                     )
                     return [device.pushkey]
 
@@ -348,27 +325,11 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
                         "apns_dispatch_try", tags=span_tags, child_of=span_parent
                     ) as span:
                         assert shaved_payload is not None
-
-                        # this is no good: APNs expects ID to be in their format
-                        # so we can't just derive a
-                        # notif_id = context.request_id + f"-{n.devices.index(device)}"
-                        notif_id = str(uuid4())
-                        # XXX: shouldn't we use the same notif_id for each retry?
-
-                        log.info(
-                            "Sending (attempt %i) => %s APNs-ID:%s room:%s, event:%s",
-                            retry_number,
-                            notif_id,
-                            device.pushkey,
-                            n.room_id,
-                            n.event_id,
-                        )
-
                         return await self._dispatch_request(
-                            log, span, device, shaved_payload, prio, notif_id
+                            log, span, device, shaved_payload, prio
                         )
                 except TemporaryNotificationDispatchException as exc:
-                    retry_delay = self.RETRY_DELAY_BASE * (2**retry_number)
+                    retry_delay = self.RETRY_DELAY_BASE * (2 ** retry_number)
                     if exc.custom_retry_delay is not None:
                         retry_delay = exc.custom_retry_delay
 
@@ -401,9 +362,23 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         Returns:
             The APNs payload as a nested dicts.
         """
+        badge = n.counts.unread
+
         payload = {}
 
         payload.update(default_payload)
+        payload.setdefault("aps", {})
+
+        payload["aps"].setdefault("mutable-content", 1)
+        payload["aps"].setdefault("sound", "default")
+
+
+        payload["aps"].setdefault("alert", {})["body"] = "You have a new encrypted notification"
+        payload["aps"].setdefault("alert", {})["title"] = "New Notification"
+
+
+        if badge is not None:
+            payload["aps"]["badge"] = badge
 
         if n.room_id:
             payload["room_id"] = n.room_id
@@ -414,7 +389,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             payload["unread_count"] = n.counts.unread
         if n.counts.missed_calls is not None:
             payload["missed_calls"] = n.counts.missed_calls
-
+        print("Payload Event ID only: " + json.dumps(payload))
         return payload
 
     def _get_payload_full(
@@ -441,6 +416,8 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
 
         loc_key = None
         loc_args = None
+        title_loc_key = None
+        title_loc_args = None
         if n.type == "m.room.message" or n.type == "m.room.encrypted":
             room_display = None
             if n.room_name:
@@ -467,29 +444,45 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             if room_display:
                 if is_image:
                     loc_key = "IMAGE_FROM_USER_IN_ROOM"
-                    loc_args = [from_display, content_display, room_display]
+                    loc_args = [content_display]
+                    title_loc_key = "TITLE_IMAGE_FROM_USER_IN_ROOM"
+                    title_loc_args =[room_display, from_display]
                 elif content_display:
                     loc_key = "MSG_FROM_USER_IN_ROOM_WITH_CONTENT"
-                    loc_args = [from_display, room_display, content_display]
+                    loc_args = [content_display]
+                    title_loc_key = "TITLE_MSG_FROM_USER_IN_ROOM_WITH_CONTENT"
+                    title_loc_args =[room_display, from_display]
                 elif action_display:
                     loc_key = "ACTION_FROM_USER_IN_ROOM"
-                    loc_args = [room_display, from_display, action_display]
+                    loc_args = [action_display]
+                    title_loc_key = "TITLE_ACTION_FROM_USER_IN_ROOM"
+                    title_loc_args =[room_display, from_display]
                 else:
                     loc_key = "MSG_FROM_USER_IN_ROOM"
-                    loc_args = [from_display, room_display]
+                    loc_args = []
+                    title_loc_key = "TITLE_MSG_FROM_USER_IN_ROOM"
+                    title_loc_args =[room_display, from_display]
             else:
                 if is_image:
                     loc_key = "IMAGE_FROM_USER"
-                    loc_args = [from_display, content_display]
+                    loc_args = [content_display]
+                    title_loc_key = "TITLE_IMAGE_FROM_USER"
+                    title_loc_args =[from_display]
                 elif content_display:
                     loc_key = "MSG_FROM_USER_WITH_CONTENT"
-                    loc_args = [from_display, content_display]
+                    loc_args = [content_display]
+                    title_loc_key = "TITLE_MSG_FROM_USER_WITH_CONTENT"
+                    title_loc_args =[from_display]
                 elif action_display:
                     loc_key = "ACTION_FROM_USER"
-                    loc_args = [from_display, action_display]
+                    loc_args = [action_display]
+                    title_loc_key = "TITLE_ACTION_FROM_USER"
+                    title_loc_args =[from_display]
                 else:
                     loc_key = "MSG_FROM_USER"
-                    loc_args = [from_display]
+                    loc_args = []
+                    title_loc_key = "TITLE_MSG_FROM_USER"
+                    title_loc_args =[from_display]
 
         elif n.type == "m.call.invite":
             is_video_call = False
@@ -527,8 +520,11 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         elif n.type:
             # A type of message was received that we don't know about
             # but it was important enough for a push to have got to us
-            loc_key = "MSG_FROM_USER"
-            loc_args = [from_display]
+            loc_key = "SOMETHING_FROM_USER"
+            loc_args = []
+            title_loc_key = "TITLE_SOMETHING_FROM_USER"
+            title_loc_args =[from_display]
+            
 
         badge = None
         if n.counts.unread is not None:
@@ -548,12 +544,20 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             payload = copy.deepcopy(device.data.get("default_payload", {}))
 
         payload.setdefault("aps", {})
+        payload["aps"].setdefault("mutable-content", 1)
+        payload["aps"].setdefault("sound", "default")
 
         if loc_key:
             payload["aps"].setdefault("alert", {})["loc-key"] = loc_key
 
         if loc_args:
             payload["aps"].setdefault("alert", {})["loc-args"] = loc_args
+
+        if title_loc_key:
+            payload["aps"].setdefault("alert", {})["title-loc-key"] = title_loc_key
+
+        if title_loc_args:
+            payload["aps"].setdefault("alert", {})["title-loc-args"] = title_loc_args
 
         if badge is not None:
             payload["aps"]["badge"] = badge
@@ -562,7 +566,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             payload["room_id"] = n.room_id
         if loc_key and n.event_id:
             payload["event_id"] = n.event_id
-
+        print("Payload Full: " + json.dumps(payload))
         return payload
 
     async def _send_notification(
@@ -571,3 +575,6 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         return await Deferred.fromFuture(
             asyncio.ensure_future(self.apns_client.send_notification(request))
         )
+
+
+
