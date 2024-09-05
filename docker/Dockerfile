@@ -54,7 +54,7 @@ RUN apt-get update && apt-get install -y git
 # install sygnal and all of the python deps to /install.
 RUN git clone --branch calvinvw/hcm https://github.com/AnAlpaca/sygnal.git /sygnal/
 #COPY . /sygnal/
-
+RUN cat /sygnal/pyproject.toml
 RUN pip install --prefix="/install" --no-warn-script-location /sygnal
 
 ###
