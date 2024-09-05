@@ -26,7 +26,7 @@ from uuid import uuid4
 
 import aioapns
 from aioapns import APNs, NotificationRequest
-from aioapns.common import NotificationResult
+from aioapns.common import NotificationResult, PushType
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509 import load_pem_x509_certificate
 from opentracing import Span, logs, tags
@@ -110,7 +110,18 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         "key_id",
         "keyfile",
         "topic",
+        "push_type",
+        "convert_device_token_to_hex",
     } | ConcurrencyLimitedPushkin.UNDERSTOOD_CONFIG_FIELDS
+
+    APNS_PUSH_TYPES = {
+        "alert": PushType.ALERT,
+        "background": PushType.BACKGROUND,
+        "voip": PushType.VOIP,
+        "complication": PushType.COMPLICATION,
+        "fileprovider": PushType.FILEPROVIDER,
+        "mdm": PushType.MDM,
+    }
 
     def __init__(self, name: str, sygnal: "Sygnal", config: Dict[str, Any]) -> None:
         super().__init__(name, sygnal, config)
@@ -163,34 +174,49 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             # this overrides the create_connection method to use a HTTP proxy
             loop = ProxyingEventLoopWrapper(loop, proxy_url_str)  # type: ignore
 
-        if certfile is not None:
-            # max_connection_attempts is actually the maximum number of
-            # additional connection attempts, so =0 means try once only
-            # (we will retry at a higher level so not worth doing more here)
-            self.apns_client = APNs(
-                client_cert=certfile,
-                use_sandbox=self.use_sandbox,
-                max_connection_attempts=0,
-                loop=loop,
-            )
+        async def make_apns() -> aioapns.APNs:
+            if certfile is not None:
+                # max_connection_attempts is actually the maximum number of
+                # additional connection attempts, so =0 means try once only
+                # (we will retry at a higher level so not worth doing more here)
+                apns_client = APNs(
+                    client_cert=certfile,
+                    use_sandbox=self.use_sandbox,
+                    max_connection_attempts=0,
+                )
 
-            self._report_certificate_expiration(certfile)
+                self._report_certificate_expiration(certfile)
+
+                return apns_client
+            else:
+                # max_connection_attempts is actually the maximum number of
+                # additional connection attempts, so =0 means try once only
+                # (we will retry at a higher level so not worth doing more here)
+                return APNs(
+                    key=self.get_config("keyfile", str),
+                    key_id=self.get_config("key_id", str),
+                    team_id=self.get_config("team_id", str),
+                    topic=self.get_config("topic", str),
+                    use_sandbox=self.use_sandbox,
+                    max_connection_attempts=0,
+                )
+
+        self.apns_client = loop.run_until_complete(make_apns())
+
+        push_type = self.get_config("push_type", str)
+        if not push_type:
+            self.push_type = None
         else:
-            # max_connection_attempts is actually the maximum number of
-            # additional connection attempts, so =0 means try once only
-            # (we will retry at a higher level so not worth doing more here)
-            self.apns_client = APNs(
-                key=self.get_config("keyfile", str),
-                key_id=self.get_config("key_id", str),
-                team_id=self.get_config("team_id", str),
-                topic=self.get_config("topic", str),
-                use_sandbox=self.use_sandbox,
-                max_connection_attempts=0,
-                loop=loop,
-            )
+            if push_type not in self.APNS_PUSH_TYPES.keys():
+                raise PushkinSetupException(f"Invalid value for push_type: {push_type}")
+
+            self.push_type = self.APNS_PUSH_TYPES[push_type]
 
         # without this, aioapns will retry every second forever.
         self.apns_client.pool.max_connection_attempts = 3
+
+        # without this, aioapns will not use the proxy if one is configured.
+        self.apns_client.pool.loop = loop
 
     def _report_certificate_expiration(self, certfile: str) -> None:
         """Export the epoch time that the certificate expires as a metric."""
@@ -210,31 +236,29 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         device: Device,
         shaved_payload: Dict[str, Any],
         prio: int,
+        notif_id: str,
     ) -> List[str]:
         """
         Actually attempts to dispatch the notification once.
         """
-
-        # this is no good: APNs expects ID to be in their format
-        # so we can't just derive a
-        # notif_id = context.request_id + f"-{n.devices.index(device)}"
-
-        notif_id = str(uuid4())
-
-        log.info(f"Sending as APNs-ID {notif_id}")
         span.set_tag("apns_id", notif_id)
 
-        device_token = base64.b64decode(device.pushkey).hex()
+        # Some client libraries will provide the push token in hex format already. Avoid
+        # attempting to convert from base 64 to hex.
+        if self.get_config("convert_device_token_to_hex", bool, True):
+            device_token = base64.b64decode(device.pushkey).hex()
+        else:
+            device_token = device.pushkey
 
         request = NotificationRequest(
             device_token=device_token,
             message=shaved_payload,
             priority=prio,
             notification_id=notif_id,
+            push_type=self.push_type,
         )
 
         try:
-
             with ACTIVE_REQUESTS_GAUGE.track_inprogress():
                 with SEND_TIME_HISTOGRAM.time():
                     response = await self._send_notification(request)
@@ -252,7 +276,7 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             return []
         else:
             # .description corresponds to the 'reason' response field
-            span.set_tag("apns_reason", response.description)
+            span.set_tag("apns_reason", response.description or "None")
             if (code, response.description) in self.TOKEN_ERRORS:
                 log.info(
                     "APNs token %s for pushkin %s was rejected: %d %s",
@@ -293,8 +317,9 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
             if device.data:
                 default_payload = device.data.get("default_payload", {})
                 if not isinstance(default_payload, dict):
-                    log.error(
-                        "default_payload is malformed, this value must be a dict."
+                    log.warning(
+                        "Rejecting pushkey due to misconfigured default_payload, "
+                        "please ensure that default_payload is a dict."
                     )
                     return [device.pushkey]
 
@@ -325,11 +350,27 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
                         "apns_dispatch_try", tags=span_tags, child_of=span_parent
                     ) as span:
                         assert shaved_payload is not None
+
+                        # this is no good: APNs expects ID to be in their format
+                        # so we can't just derive a
+                        # notif_id = context.request_id + f"-{n.devices.index(device)}"
+                        notif_id = str(uuid4())
+                        # XXX: shouldn't we use the same notif_id for each retry?
+
+                        log.info(
+                            "Sending (attempt %i) => %s APNs-ID:%s room:%s, event:%s",
+                            retry_number,
+                            notif_id,
+                            device.pushkey,
+                            n.room_id,
+                            n.event_id,
+                        )
+
                         return await self._dispatch_request(
-                            log, span, device, shaved_payload, prio
+                            log, span, device, shaved_payload, prio, notif_id
                         )
                 except TemporaryNotificationDispatchException as exc:
-                    retry_delay = self.RETRY_DELAY_BASE * (2 ** retry_number)
+                    retry_delay = self.RETRY_DELAY_BASE * (2**retry_number)
                     if exc.custom_retry_delay is not None:
                         retry_delay = exc.custom_retry_delay
 
@@ -575,6 +616,3 @@ class ApnsPushkin(ConcurrencyLimitedPushkin):
         return await Deferred.fromFuture(
             asyncio.ensure_future(self.apns_client.send_notification(request))
         )
-
-
-
